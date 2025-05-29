@@ -51,7 +51,7 @@ class BaseTreePolicy(BaseContextualPolicy):
         """Initialize class."""
         super().__post_init__()
         
-    def update_models(self) -> None:
+    def _update_models(self) -> None:
         """Update tree models."""
         pass
 
@@ -184,7 +184,7 @@ class TreeBootstrap(BaseTreePolicy):
                   # Return actions with highest scores
         return action_scores.argsort()[::-1][: self.len_list]
         
-    def update_models(self) -> None:
+    def _update_models(self) -> None:
         """Update tree models.
         
         For TreeBootstrap, this is optional because the models are rebuilt during each
@@ -299,7 +299,7 @@ class TreeUCB(BaseTreePolicy):
             raise ValueError("Expected `context.shape[0] == 1`, but found it False")
 
         # Update models for all actions with current data
-        self.update_models()
+        self._update_models()
         
         # Calculate UCB score for each action
         ucb_scores = np.zeros(self.n_actions)
@@ -334,7 +334,7 @@ class TreeUCB(BaseTreePolicy):
         # Return actions with highest UCB scores
         return ucb_scores.argsort()[::-1][: self.len_list]
         
-    def update_models(self) -> None:
+    def _update_models(self) -> None:
         """Update tree models for all actions using available data."""
         for action in range(self.n_actions):
             if len(self.reward_lists[action]) >= 2:  # Need at least 2 samples for a tree
@@ -392,8 +392,8 @@ class TreeEnsembleUCB(BaseTreePolicy):
     
     References
     ----------
-    Alberto Maria Metelli, Alessio Russo, and Marcello Restelli.
-    "Sublinear Regret Bounds for Bayesian Optimisation in Unknown Search Spaces," 2019.
+    Nilsson, Hannes, Rikard Johansson, Niklas Åkerblom, and Morteza Haghir Chehreghani. 2024. 
+    “Tree Ensembles for Contextual Bandits.” arXiv [Cs.LG]. arXiv. http://arxiv.org/abs/2402.06963.
     """
     
     init_rounds: int = 10  # Number of initial rounds for random exploration
@@ -420,6 +420,8 @@ class TreeEnsembleUCB(BaseTreePolicy):
         
         # Initialize model list
         if self.xgb_available:
+            # Use XGBoost if available
+            # Create a list of XGBRegressor models for each action
             self.model_list = [
                 XGBRegressor(
                     n_estimators=self.n_estimators, 
@@ -430,18 +432,11 @@ class TreeEnsembleUCB(BaseTreePolicy):
                 for _ in range(self.n_actions)
             ]
         else:
-            self.model_list = [
-                GradientBoostingRegressor(
-                    n_estimators=self.n_estimators,
-                    learning_rate=self.learning_rate,
-                    max_depth=self.max_depth,
-                    random_state=self.random_state
-                )
-                for _ in range(self.n_actions)
-            ]
+            # Fallback to Random Forest if XGBoost is not available
+            print("XGBoost not available, under development right now.")
 
     def update_params(self, action: int, reward: float, context: np.ndarray) -> None:
-        """Update data.
+        """Accumulate data.
 
         Parameters
         ----------
@@ -474,6 +469,7 @@ class TreeEnsembleUCB(BaseTreePolicy):
         selected_actions: array-like, shape (len_list, )
             List of selected actions.
         """
+        # Check context shape
         check_array(array=context, name="context", expected_dim=2)
         if context.shape[0] != 1:
             raise ValueError("Expected `context.shape[0] == 1`, but found it False")
@@ -485,21 +481,19 @@ class TreeEnsembleUCB(BaseTreePolicy):
             )
         
         # Update models with current data
-        self.update_models()
+        self._update_models()
         
         # Calculate UCB score for each action
         ucb_scores = np.zeros(self.n_actions)
         
         for action in range(self.n_actions):
             if len(self.reward_lists[action]) > 0:
-                # Get mean prediction and variance estimate
-                mean_pred, variance = self._get_ensemble_prediction_with_variance(context, action)
+                # Get mean prediction and variance estimate and c_{t,a} for this action
+                mean_pred, variance, c_t_a = self._get_ensemble_prediction_with_variance(context, action)
                 
-                # Calculate UCB score using the formula from algo.md
-                # UCB = μ̃ + ν√(σ̃²ln(t-1) / c_{t,a})
-                n_samples = len(self.reward_lists[action])
+                # Calculate UCB score using the formula
                 exploration_bonus = self.nu * np.sqrt(
-                    variance * np.log(max(1, self.n_trial - 1)) / max(1, n_samples)
+                    variance * np.log(max(1, self.n_trial - 1)) / c_t_a
                 )
                 ucb_scores[action] = mean_pred + exploration_bonus
             else:
@@ -626,7 +620,7 @@ class TreeEnsembleUCB(BaseTreePolicy):
             
         Returns
         -------
-        tuple: (mean_prediction, variance)
+        tuple: (mean_prediction, variance, c_t_a)
             Mean prediction and variance from the ensemble model.
         """
         model = self.model_list[action]
@@ -637,91 +631,40 @@ class TreeEnsembleUCB(BaseTreePolicy):
         if self.xgb_available:
             # XGBoost implementation with improved variance estimation
             mean_pred = model.predict(context)[0]
+
+            # Extract predictions from individual trees in the ensemble
+            booster = model.get_booster()
+            # Get number of trees from the booster dump
+            n_trees = len(booster.get_dump())  
+            # leaf_stats need calculating
+            leaf_stats = model.leaf_value_stats
+            tree_variance = 0.0
+            effective_sample_count = 0.0
             
-            try:
-                # Extract predictions from individual trees in the ensemble
-                booster = model.get_booster()
-                n_trees = len(booster.get_dump())  # Get number of trees from the booster dump
+            # Get leaf indices for current context
+            leaf_indices = booster.predict(context, pred_leaf=True)
+            
+            # Aggregate statistics from leaves where context falls
+            for tree_idx in range(n_trees):
+                leaf_idx = int(leaf_indices[0][tree_idx] if len(leaf_indices[0]) > tree_idx else leaf_indices[0][0])
                 
-                # Check if we have pre-calculated leaf statistics
-                if hasattr(model, 'leaf_stats'):
-                    leaf_stats = model.leaf_stats
-                    tree_variance = 0.0
-                    effective_sample_count = 0.0
-                    
-                    # Get leaf indices for current context
-                    leaf_indices = booster.predict(context, pred_leaf=True)
-                    
-                    # Aggregate statistics from leaves where context falls
-                    for tree_idx in range(n_trees):
-                        leaf_idx = int(leaf_indices[0][tree_idx] if len(leaf_indices[0]) > tree_idx else leaf_indices[0][0])
-                        
-                        if tree_idx in leaf_stats and leaf_idx in leaf_stats[tree_idx]:
-                            stats = leaf_stats[tree_idx][leaf_idx]
-                            # Add to variance (weighted by tree maturity)
-                            tree_weight = (tree_idx + 1) / n_trees
-                            tree_variance += stats['var'] * tree_weight
-                            # Use harmonic mean for effective sample count
-                            if stats['count'] > 0:
-                                effective_sample_count += 1.0 / stats['count']
-                        else:
-                            # Fallback if leaf not in statistics
-                            tree_variance += 0.1 / n_trees
-                            effective_sample_count += 1.0 / max(1, n_samples_total // n_trees)
-                    
-                    # Calculate final effective sample count
-                    if effective_sample_count > 0:
-                        c_t_a = n_trees / effective_sample_count
-                    else:
-                        c_t_a = n_samples_total
+                if tree_idx in leaf_stats and leaf_idx in leaf_stats[tree_idx]:
+                    stats = leaf_stats[tree_idx][leaf_idx]
+                    # Add to variance (weighted by tree maturity)
+                    tree_weight = (tree_idx + 1) / n_trees
+                    tree_variance += stats['var'] * tree_weight
+                    # Use harmonic mean for effective sample count
+                    if stats['count'] > 0:
+                        effective_sample_count += 1.0 / stats['count']
                 else:
-                    # Fall back to original implementation if leaf_stats not available
-                    # Get tree predictions
-                    tree_preds = []
-                    tree_weights = []
-                    
-                    # For each tree, get its contribution
-                    prev_pred = 0
-                    for tree_idx in range(n_trees):
-                        # Get prediction up to this tree
-                        curr_pred = model.predict(context, iteration_range=(0, tree_idx+1))[0]
-                        # Extract this tree's contribution
-                        tree_pred = curr_pred - prev_pred
-                        prev_pred = curr_pred
-                        
-                        tree_preds.append(tree_pred)
-                        # More mature trees typically have higher weight
-                        tree_weights.append((tree_idx + 1) / n_trees)
-                    
-                    # Calculate weighted variance across tree predictions
-                    if len(tree_preds) > 1:
-                        tree_variance = np.average((np.array(tree_preds) - np.mean(tree_preds))**2, 
-                                                weights=tree_weights)
-                    else:
-                        tree_variance = 0.1
-                    
-                    # Use XGBoost predict with pred_leaf=True to get leaf indices
-                    try:
-                        leaf_indices = booster.predict(context, pred_leaf=True)[0]
-                        
-                        # Estimate sample counts based on leaf indices
-                        leaf_weight = (np.arange(n_trees) + 1) / n_trees
-                        leaf_samples = np.maximum(1, (n_samples_total * leaf_weight * 0.8).astype(int))
-                        
-                        # Calculate effective sample count - harmonic mean to be conservative
-                        c_t_a = n_trees / np.sum(1.0 / leaf_samples)
-                    except Exception:
-                        # If leaf-specific approach fails, use a more basic estimate
-                        c_t_a = n_samples_total / max(1, n_trees**0.5)
-            except Exception:
-                # Fallback to basic approach if the advanced method fails
-                leaf_preds = []
-                booster = model.get_booster()
-                n_trees = len(booster.get_dump())  # Get number of trees from the booster dump
-                for tree_idx in range(n_trees):
-                    leaf_preds.append(model.predict(context, iteration_range=(0, tree_idx+1))[0])
-                
-                tree_variance = np.var(leaf_preds) if len(leaf_preds) > 1 else 0.1
+                    # Fallback if leaf not in statistics
+                    tree_variance += 0.1 / n_trees
+                    effective_sample_count += 1.0 / max(1, n_samples_total // n_trees)
+            
+            # Calculate final effective sample count
+            if effective_sample_count > 0:
+                c_t_a = n_trees / effective_sample_count
+            else:
                 c_t_a = n_samples_total
             
             # Final variance calculation
@@ -781,9 +724,9 @@ class TreeEnsembleUCB(BaseTreePolicy):
                 c_t_a = n_samples_total
         
         # For UCB, we use the variance of the ensemble prediction
-        return mean_pred, variance / max(1, c_t_a)
+        return mean_pred, variance, c_t_a
 
-    def update_models(self) -> None:
+    def _update_models(self) -> None:
         """Update ensemble tree models for all actions using available data."""
         for action in range(self.n_actions):
             if len(self.reward_lists[action]) >= 2:  # Need at least 2 samples to fit
@@ -805,9 +748,8 @@ class TreeEnsembleUCB(BaseTreePolicy):
                             
                             # Fit the model with available data
                             self.model_list[action].fit(contexts, rewards)
-                            
                             # Calculate and store leaf statistics
-                            self.model_list[action].leaf_stats = self._set_leaf_values(
+                            self.model_list[action].leaf_value_stats = self._set_leaf_values(
                                 self.model_list[action], contexts, rewards
                             )
                         else:
